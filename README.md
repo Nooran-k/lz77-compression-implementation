@@ -1,1 +1,1 @@
-# lz77-compression-implpementation
+# lz77-compression-implementation
