@@ -1,209 +1,155 @@
 from __future__ import annotations
-from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from lz77.matcher import test_longest_match_file
-# ============================================================
-# # SETTINGS
-# ============================================================
-TEXT_EXTENSION = ".txt"
-COMPRESSED_EXTENSION = ".lz77"
-# ============================================================
-# MENU DISPLAY
-# ============================================================
+
+from lz77.binary_format import write_lz77_file
+from lz77.compressor import compress, compression_ratio_percent, format_tags
+from lz77.matcher import (
+    DEFAULT_LOOKAHEAD_SIZE,
+    DEFAULT_WINDOW_SIZE,
+    test_longest_match_file,
+)
+from utils.file_handler import (
+    COMPRESSED_EXTENSION,
+    TEXT_EXTENSION,
+    file_size_bytes,
+    get_compressed_output_path,
+    read_text_file,
+    select_compressed_file,
+    select_text_file,
+)
+
 
 def print_separator(
     character: str = "=",
     length: int = 70,
 ) -> None:
-
     print(character * length)
 
 
-def print_title(
-    title: str,
-) -> None:
-
+def print_title(title: str) -> None:
     print()
     print_separator()
     print(f"{title:^70}")
     print_separator()
 
 
-# ============================================================
-# FILE SELECTION
-# ============================================================
+def compression_menu() -> None:
+    print_title("COMPRESS A FILE")
 
-def select_text_file() -> Path | None:
+    input_path = select_text_file()
+    if input_path is None:
+        print("No file selected.")
+        return
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-
-    try:
-
-        file_path = filedialog.askopenfilename(
-            title="Select a text file",
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ],
-        )
-
-    finally:
-
-        root.destroy()
-
-    if not file_path:
-        return None
-
-    path = Path(file_path)
-
-    if path.suffix.lower() != TEXT_EXTENSION:
-
-        messagebox.showerror(
-            "Invalid File",
-            "Please select a .txt file.",
-        )
-
-        return None
-
-    return path
-
-
-def select_compressed_file() -> Path | None:
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+    if input_path.suffix.lower() != TEXT_EXTENSION:
+        print("Please select a .txt file.")
+        return
 
     try:
+        text = read_text_file(input_path)
+    except RuntimeError as error:
+        print(error)
+        return
 
-        file_path = filedialog.askopenfilename(
-            title="Select an LZ77 compressed file",
-            filetypes=[
-                ("LZ77 compressed files", "*.lz77"),
-                ("All files", "*.*"),
-            ],
-        )
+    if text == "":
+        print()
+        print("The selected file is empty.")
+        print("An empty .lz77 file will still be written.")
 
-    finally:
+    window_size = DEFAULT_WINDOW_SIZE
+    lookahead_size = DEFAULT_LOOKAHEAD_SIZE
 
-        root.destroy()
-
-    if not file_path:
-        return None
-
-    path = Path(file_path)
-
-    if path.suffix.lower() != COMPRESSED_EXTENSION:
-
-        messagebox.showerror(
-            "Invalid File",
-            "Please select a .lz77 file.",
-        )
-
-        return None
-
-    return path
-
-
-# ============================================================
-# OUTPUT PATHS
-# ============================================================
-
-def get_compressed_output_path(
-    input_path: Path,
-) -> Path:
-
-    return input_path.with_suffix(
-        COMPRESSED_EXTENSION
+    tags = compress(
+        text,
+        window_size=window_size,
+        lookahead_size=lookahead_size,
     )
 
+    print()
+    print("LZ77 Tags:")
+    print("-" * 32)
+    print(format_tags(tags))
+    print("-" * 32)
 
-def get_decompressed_output_path(
-    input_path: Path,
-) -> Path:
+    output_path = get_compressed_output_path(input_path)
 
-    return input_path.with_name(
-        f"{input_path.stem}_decompressed.txt"
-    )
+    try:
+        write_lz77_file(
+            file_path=output_path,
+            tokens=tags,
+            window_size=window_size,
+            lookahead_size=lookahead_size,
+        )
+    except (ValueError, RuntimeError) as error:
+        print()
+        print("Could not write the compressed file:")
+        print(error)
+        return
 
-# ============================================================
-# MAIN MENU
-# ============================================================
+    original_size = len(text.encode("utf-8"))
+    compressed_size = file_size_bytes(output_path)
+    ratio = compression_ratio_percent(original_size, compressed_size)
+
+    print()
+    print("Compression completed successfully!")
+    print()
+    print(f"Original size   : {original_size} bytes")
+    print(f"Compressed size : {compressed_size} bytes")
+    print(f"Compression     : {ratio:.2f}%")
+    print()
+    print("Output file:")
+    print(output_path)
+
+
+def decompression_menu() -> None:
+    print_title("DECOMPRESS A FILE")
+    print()
+    print("Decompression is the decoder team's part.")
+    print("The encoder already writes a complete .lz77 file.")
+    print()
+
+    selected = select_compressed_file()
+    if selected is None:
+        print("No file selected.")
+        return
+
+    if selected.suffix.lower() != COMPRESSED_EXTENSION:
+        print("Invalid LZ77 file.")
+        return
+
+    print(f"Selected: {selected}")
+    print("Waiting for lz77/decompressor.py to reconstruct the text.")
+
 
 def show_menu() -> None:
-
     while True:
-
+        print()
+        print_separator()
+        print("LZ77 COMPRESSOR".center(70))
+        print_separator()
+        print()
+        print("  1. Compress a file")
+        print("  2. Decompress a file")
+        print("  3. Test Longest Match / LZ77 Tags")
+        print("  4. Exit")
         print()
         print_separator()
 
-        print(
-            "LZ77 FILE COMPRESSION TOOL".center(70)
-        )
-
-        print_separator()
-
-        print()
-
-        print(
-            "  1. Compress a .txt file"
-        )
-
-        print(
-            "  2. Decompress a .lz77 file"
-        )
-
-        print(
-            "  3. Test Longest Match / LZ77 Tags"
-        )
-
-        print(
-            "  4. Exit"
-        )
-
-        print()
-
-        print_separator()
-
-        choice = input(
-            "Choose an option: "
-        ).strip()
+        choice = input("Enter your choice: ").strip()
 
         if choice == "1":
-
             compression_menu()
-
         elif choice == "2":
-
             decompression_menu()
-
         elif choice == "3":
-
             test_longest_match_file()
-
         elif choice == "4":
-
             print("\nGoodbye!")
             break
-
         else:
-
             print()
-            print(
-                "Invalid choice."
-            )
+            print("Invalid choice.")
+            print("Please choose 1, 2, 3, or 4.")
 
-            print(
-                "Please choose 1, 2, 3, or 4."
-            )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 def main() -> None:
     show_menu()
@@ -211,3 +157,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+ 
+     
