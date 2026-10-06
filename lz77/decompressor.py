@@ -24,7 +24,3 @@ def decompress(tags: list[tuple[int, int, str | None]]) -> str:
             output.append(next_char)
 
     return "".join(output)
-
-
-# Function alias if required by assignment instructions
-lz77_decode = decompress
