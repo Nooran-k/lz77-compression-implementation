@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from lz77.binary_format import write_lz77_file
+from lz77.binary_format import read_lz77_file, write_lz77_file
 from lz77.compressor import compress, compression_ratio_percent, format_tags
+from lz77.decompressor import decompress
 from lz77.matcher import (
     DEFAULT_LOOKAHEAD_SIZE,
     DEFAULT_WINDOW_SIZE,
@@ -12,16 +13,15 @@ from utils.file_handler import (
     TEXT_EXTENSION,
     file_size_bytes,
     get_compressed_output_path,
+    get_decompressed_output_path,
     read_text_file,
     select_compressed_file,
     select_text_file,
+    write_text_file,
 )
 
 
-def print_separator(
-    character: str = "=",
-    length: int = 70,
-) -> None:
+def print_separator(character: str = "=", length: int = 70) -> None:
     print(character * length)
 
 
@@ -102,10 +102,6 @@ def compression_menu() -> None:
 
 def decompression_menu() -> None:
     print_title("DECOMPRESS A FILE")
-    print()
-    print("Decompression is the decoder team's part.")
-    print("The encoder already writes a complete .lz77 file.")
-    print()
 
     selected = select_compressed_file()
     if selected is None:
@@ -116,9 +112,28 @@ def decompression_menu() -> None:
         print("Invalid LZ77 file.")
         return
 
-    print(f"Selected: {selected}")
-    print("Waiting for lz77/decompressor.py to reconstruct the text.")
+    try:
+        # 1. Read binary file to get LZ77 tags
+        tags, window_size, lookahead_size = read_lz77_file(selected)
 
+        # 2. Decompress tags back to text
+        reconstructed_text = decompress(tags)
+
+        # 3. Save text to output file
+        output_path = get_decompressed_output_path(selected)
+        write_text_file(output_path, reconstructed_text)
+
+        print()
+        print("Decompression completed successfully!")
+        print(f"Tags processed: {len(tags)}")
+        print(f"Reconstructed   : {len(reconstructed_text)} characters")
+        print()
+        print("Output file:")
+        print(output_path)
+
+    except Exception as error:
+        print()
+        print(f"Error during decompression: {error}")
 
 def show_menu() -> None:
     while True:
@@ -157,6 +172,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
- 
-     
