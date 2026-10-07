@@ -1,177 +1,194 @@
 """
-LZ77 Binary File Format
-=======================
+Compact binary format for LZ77 files.
 
-This module defines the binary format used for LZ77 results.
+Version 2 stores LZ77 tags using a compact control byte and then compresses
+the token stream with zlib. The public API remains the same.
 
-The binary file stores the SAME LZ77 information produced by the
-text result, but in real binary form.
+v2 header:
+    Magic          4 bytes
+    Version        1 byte
+    Storage mode   1 byte (0 = LZ77 tokens, 1 = UTF-8 literal fallback)
+    Window size    2 bytes
+    Look-ahead     2 bytes
+    Token count    4 bytes
+    Payload size   4 bytes
 
-Each token contains:
+For ordinary files, the writer compares the compressed LZ77-token stream
+with a compressed UTF-8 literal stream and stores the smaller one. The
+literal fallback is still represented as valid LZ77 literal tags when read.
 
-    (offset, length, next_character)
+Token stream control bytes:
+    0x00 = literal: followed by one UTF-8 character
+    0x01 = match: followed by offset(1 byte), length(1 byte)
+    0x02 = match + next character: offset, length, UTF-8 character
+    0x03 = extended match: offset(2 bytes), length(2 bytes)
+    0x04 = extended match + next character: offset(2), length(2), character
 
-Example:
-
-    (0, 0, "A")
-    (1, 5, None)
-
-The binary file also stores:
-
-    - Window size
-    - Look-ahead size
-    - Number of tokens
-
-File structure
---------------
-
-Header:
-    Magic              : 4 bytes
-    Version            : 1 byte
-    Window size        : 4 bytes
-    Look-ahead size    : 4 bytes
-    Token count        : 4 bytes
-
-Each token:
-    Offset             : 4 bytes
-    Length             : 4 bytes
-    Next-character size: 4 bytes
-    Next-character     : variable UTF-8 bytes
-
-All integer values are unsigned 32-bit little-endian.
-
-If next_character is None:
-    next_character_size = 0
+This removes the old 12-byte-per-tag overhead.
+Version 1 files written by the original project are still readable.
 """
 
 from __future__ import annotations
 
-import struct
+from io import BytesIO
 from pathlib import Path
+import struct
+import zlib
 
 LZ77Token = tuple[int, int, str | None]
 
 MAGIC = b"LZ77"
-VERSION = 1
-MAX_UINT32 = 2**32 - 1
+VERSION = 2
+LEGACY_VERSION = 1
 COMPRESSED_EXTENSION = ".lz77"
 
-HEADER_FORMAT = "<4sBIII"
-TOKEN_HEADER_FORMAT = "<III"
+HEADER_FORMAT = "<4sBBHHII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-TOKEN_HEADER_SIZE = struct.calcsize(TOKEN_HEADER_FORMAT)
+
+MAX_UINT8 = 255
+MAX_UINT16 = 65535
+MAX_UINT32 = 2**32 - 1
 
 
-def _validate_uint32(value: int, name: str) -> None:
-    """Validate an integer that will be stored as unsigned 32-bit."""
-
+def _validate_uint(value: int, maximum: int, name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be an integer.")
-
-    if value < 0:
-        raise ValueError(f"{name} cannot be negative.")
-
-    if value > MAX_UINT32:
-        raise ValueError(f"{name} is too large for the binary format.")
+    if value < 0 or value > maximum:
+        raise ValueError(f"{name} must be between 0 and {maximum}.")
 
 
 def _validate_token(token: LZ77Token) -> None:
-    """
-    Validate one LZ77 token.
-
-    Expected format:
-        (offset, length, next_character)
-    """
-
-    if not isinstance(token, tuple):
-        raise TypeError("Each LZ77 token must be a tuple.")
-
-    if len(token) != 3:
+    if not isinstance(token, tuple) or len(token) != 3:
         raise ValueError(
             "Each LZ77 token must contain (offset, length, next_character)."
         )
 
     offset, length, next_character = token
-    _validate_uint32(offset, "offset")
-    _validate_uint32(length, "length")
+    _validate_uint(offset, MAX_UINT16, "offset")
+    _validate_uint(length, MAX_UINT16, "length")
 
     if next_character is not None and not isinstance(next_character, str):
         raise TypeError("next_character must be a string or None.")
-
     if next_character is not None and len(next_character) != 1:
         raise ValueError(
             "next_character must contain exactly one character or be None."
         )
 
 
+def _encode_character(character: str) -> bytes:
+    data = character.encode("utf-8")
+    if not 1 <= len(data) <= 4:
+        raise ValueError("A UTF-8 character must occupy 1 to 4 bytes.")
+    return data
+
+
+def _utf8_char_size(first_byte: int) -> int:
+    """Return the byte count of one UTF-8 code point from its first byte."""
+    if first_byte < 0x80:
+        return 1
+    if 0xC0 <= first_byte <= 0xDF:
+        return 2
+    if 0xE0 <= first_byte <= 0xEF:
+        return 3
+    if 0xF0 <= first_byte <= 0xF4:
+        return 4
+    raise ValueError("Corrupted LZ77 file: invalid UTF-8 leading byte.")
+
+
+def _read_character(stream: BytesIO) -> str:
+    first = stream.read(1)
+    if len(first) != 1:
+        raise ValueError("Corrupted LZ77 file: missing next_character.")
+
+    size = _utf8_char_size(first[0])
+    rest = stream.read(size - 1)
+    if len(rest) != size - 1:
+        raise ValueError("Corrupted LZ77 file: incomplete next_character.")
+
+    data = first + rest
+    try:
+        character = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            "Corrupted LZ77 file: invalid UTF-8 next_character."
+        ) from error
+
+    if len(character) != 1:
+        raise ValueError(
+            "Corrupted LZ77 file: next_character must be one character."
+        )
+    return character
+
+
 def encode_token(token: LZ77Token) -> bytes:
-    """
-    Convert one LZ77 token into binary bytes.
-
-    Example:
-        (5, 3, "A")
-    becomes:
-        offset
-        length
-        character byte length
-        character bytes
-    """
-
+    """Encode one LZ77 tag using the smallest suitable representation."""
     _validate_token(token)
     offset, length, next_character = token
 
-    if next_character is None:
-        next_character_bytes = b""
+    if offset == 0 and length == 0:
+        if next_character is None:
+            # Only useful for an unusual/invalid LZ77 tag, but keep it valid.
+            return b"\x01\x00\x00"
+        return b"\x00" + _encode_character(next_character)
+
+    if offset <= MAX_UINT8 and length <= MAX_UINT8:
+        control = 0x02 if next_character is not None else 0x01
+        data = bytearray((control, offset, length))
     else:
-        next_character_bytes = next_character.encode("utf-8")
+        control = 0x04 if next_character is not None else 0x03
+        data = bytearray((control,))
+        data.extend(struct.pack("<HH", offset, length))
 
-    next_character_length = len(next_character_bytes)
-    _validate_uint32(next_character_length, "next_character byte length")
+    if next_character is not None:
+        data.extend(_encode_character(next_character))
 
-    token_header = struct.pack(
-        TOKEN_HEADER_FORMAT,
-        offset,
-        length,
-        next_character_length,
-    )
-    return token_header + next_character_bytes
+    return bytes(data)
 
 
-def decode_token(file_object) -> LZ77Token:
-    """Read one LZ77 token from an opened binary file."""
+def _encode_tokens(tokens: list[LZ77Token]) -> bytes:
+    raw = bytearray()
+    for token in tokens:
+        raw.extend(encode_token(token))
+    return bytes(raw)
 
-    header_bytes = file_object.read(TOKEN_HEADER_SIZE)
-    if not header_bytes:
-        raise EOFError("No more LZ77 tokens are available.")
 
-    if len(header_bytes) != TOKEN_HEADER_SIZE:
-        raise ValueError("Corrupted LZ77 file: incomplete token header.")
+def decode_token(stream: BytesIO) -> LZ77Token:
+    control_data = stream.read(1)
+    if len(control_data) != 1:
+        raise ValueError("Corrupted LZ77 file: incomplete token.")
 
-    offset, length, next_character_length = struct.unpack(
-        TOKEN_HEADER_FORMAT,
-        header_bytes,
-    )
+    control = control_data[0]
 
-    if next_character_length == 0:
-        return offset, length, None
+    if control == 0x00:
+        return 0, 0, _read_character(stream)
 
-    next_character_bytes = file_object.read(next_character_length)
-    if len(next_character_bytes) != next_character_length:
-        raise ValueError("Corrupted LZ77 file: incomplete next_character data.")
+    if control in (0x01, 0x02):
+        pair = stream.read(2)
+        if len(pair) != 2:
+            raise ValueError("Corrupted LZ77 file: incomplete match token.")
+        offset, length = pair
+        character = _read_character(stream) if control == 0x02 else None
+        return offset, length, character
 
-    try:
-        next_character = next_character_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
+    if control in (0x03, 0x04):
+        pair = stream.read(4)
+        if len(pair) != 4:
+            raise ValueError("Corrupted LZ77 file: incomplete extended token.")
+        offset, length = struct.unpack("<HH", pair)
+        character = _read_character(stream) if control == 0x04 else None
+        return offset, length, character
+
+    raise ValueError(f"Corrupted LZ77 file: unknown token control {control:#x}.")
+
+
+def _decode_tokens(payload: bytes, token_count: int) -> list[LZ77Token]:
+    stream = BytesIO(payload)
+    tokens = [decode_token(stream) for _ in range(token_count)]
+    if stream.read(1):
         raise ValueError(
-            "Corrupted LZ77 file: next_character is not valid UTF-8."
-        ) from error
-
-    if len(next_character) != 1:
-        raise ValueError(
-            "Corrupted LZ77 file: next_character must contain exactly one character."
+            "Corrupted LZ77 file: unexpected data after the last token."
         )
-
-    return offset, length, next_character
+    return tokens
 
 
 def write_header(
@@ -179,52 +196,27 @@ def write_header(
     window_size: int,
     lookahead_size: int,
     token_count: int,
+    payload_size: int = 0,
+    storage_mode: int = 0,
 ) -> None:
-    """Write the LZ77 binary file header."""
+    _validate_uint(window_size, MAX_UINT16, "window_size")
+    _validate_uint(lookahead_size, MAX_UINT16, "lookahead_size")
+    _validate_uint(token_count, MAX_UINT32, "token_count")
+    _validate_uint(payload_size, MAX_UINT32, "payload_size")
+    _validate_uint(storage_mode, 1, "storage_mode")
 
-    _validate_uint32(window_size, "window_size")
-    _validate_uint32(lookahead_size, "lookahead_size")
-    _validate_uint32(token_count, "token_count")
-
-    header = struct.pack(
-        HEADER_FORMAT,
-        MAGIC,
-        VERSION,
-        window_size,
-        lookahead_size,
-        token_count,
-    )
-    file_object.write(header)
-
-
-def read_header(file_object) -> tuple[int, int, int]:
-    """
-    Read and validate the LZ77 binary file header.
-
-    Returns:
-        (
+    file_object.write(
+        struct.pack(
+            HEADER_FORMAT,
+            MAGIC,
+            VERSION,
+            storage_mode,
             window_size,
             lookahead_size,
-            token_count
+            token_count,
+            payload_size,
         )
-    """
-
-    header_bytes = file_object.read(HEADER_SIZE)
-    if len(header_bytes) != HEADER_SIZE:
-        raise ValueError("Invalid LZ77 file: incomplete header.")
-
-    magic, version, window_size, lookahead_size, token_count = struct.unpack(
-        HEADER_FORMAT,
-        header_bytes,
     )
-
-    if magic != MAGIC:
-        raise ValueError("Invalid LZ77 file: incorrect file signature.")
-
-    if version != VERSION:
-        raise ValueError(f"Unsupported LZ77 file version: {version}")
-
-    return window_size, lookahead_size, token_count
 
 
 def write_lz77_file(
@@ -233,79 +225,184 @@ def write_lz77_file(
     window_size: int,
     lookahead_size: int,
 ) -> None:
-    """
-    Write a complete LZ77 binary file.
-
-    The file contains:
-        Header
-        Token 1
-        Token 2
-        Token 3
-        ...
-        Token N
-    """
-
     path = Path(file_path)
-
     if path.suffix.lower() != COMPRESSED_EXTENSION:
         raise ValueError("LZ77 binary files must use the .lz77 extension.")
-
     if not isinstance(tokens, list):
         raise TypeError("tokens must be a list.")
 
     for token in tokens:
         _validate_token(token)
 
+    # Candidate A: actual LZ77 tags.
+    token_payload = _encode_tokens(tokens)
+    token_compressed = zlib.compress(token_payload, level=9)
+
+    # Candidate B: original UTF-8 text represented by literal LZ77 tags.
+    # This avoids expansion on inputs where the LZ77 tag overhead is larger
+    # than the source data. The reader turns it back into valid literal tags.
+    # Reconstruct the source text from the LZ77 tags for the fallback
+    # candidate. This keeps the binary_format module independent.
+    reconstructed: list[str] = []
+    for offset, length, character in tokens:
+        if length:
+            start = len(reconstructed) - offset
+            if start < 0:
+                raise ValueError(
+                    "Invalid LZ77 token: offset points before the output."
+                )
+            for index in range(length):
+                reconstructed.append(reconstructed[start + index])
+        if character is not None:
+            reconstructed.append(character)
+
+    original_text = "".join(reconstructed)
+    literal_compressed = zlib.compress(
+        original_text.encode("utf-8"),
+        level=9,
+    )
+
+    if len(literal_compressed) < len(token_compressed):
+        storage_mode = 1
+        compressed_payload = literal_compressed
+    else:
+        storage_mode = 0
+        compressed_payload = token_compressed
+
     try:
         with path.open("wb") as file_object:
             write_header(
-                file_object=file_object,
-                window_size=window_size,
-                lookahead_size=lookahead_size,
-                token_count=len(tokens),
+                file_object,
+                window_size,
+                lookahead_size,
+                len(original_text) if storage_mode == 1 else len(tokens),
+                len(compressed_payload),
+                storage_mode,
             )
-            for token in tokens:
-                file_object.write(encode_token(token))
+            file_object.write(compressed_payload)
     except OSError as error:
         raise RuntimeError(f"Could not write LZ77 file:\n{error}") from error
+
+
+def _read_legacy_v1(file_object):
+    legacy_token_format = "<III"
+    token_header_size = struct.calcsize(legacy_token_format)
+
+    rest = file_object.read(12)
+    if len(rest) != 12:
+        raise ValueError("Invalid legacy LZ77 file: incomplete header.")
+
+    window_size, lookahead_size, token_count = struct.unpack("<III", rest)
+    tokens = []
+
+    for _ in range(token_count):
+        header = file_object.read(token_header_size)
+        if len(header) != token_header_size:
+            raise ValueError("Corrupted legacy LZ77 file: incomplete token.")
+
+        offset, length, char_size = struct.unpack(legacy_token_format, header)
+
+        if char_size == 0:
+            tokens.append((offset, length, None))
+            continue
+
+        char_bytes = file_object.read(char_size)
+        if len(char_bytes) != char_size:
+            raise ValueError("Corrupted legacy LZ77 file: incomplete character.")
+
+        try:
+            character = char_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("Corrupted legacy LZ77 file: invalid UTF-8.") from error
+
+        if len(character) != 1:
+            raise ValueError(
+                "Corrupted legacy LZ77 file: character must be exactly one character."
+            )
+
+        tokens.append((offset, length, character))
+
+    if file_object.read(1):
+        raise ValueError("Corrupted legacy LZ77 file: unexpected trailing data.")
+
+    return tokens, window_size, lookahead_size
 
 
 def read_lz77_file(
     file_path: str | Path,
 ) -> tuple[list[LZ77Token], int, int]:
-    """
-    Read a complete LZ77 binary file.
-
-    Returns:
-        (
-            tokens,
-            window_size,
-            lookahead_size
-        )
-    """
-
     path = Path(file_path)
 
     if path.suffix.lower() != COMPRESSED_EXTENSION:
         raise ValueError("Expected a .lz77 file.")
-
     if not path.exists():
         raise FileNotFoundError(f"LZ77 file does not exist:\n{path}")
 
     try:
         with path.open("rb") as file_object:
-            window_size, lookahead_size, token_count = read_header(file_object)
-            tokens: list[LZ77Token] = []
+            prefix = file_object.read(5)
+            if len(prefix) != 5:
+                raise ValueError("Invalid LZ77 file: incomplete header.")
 
-            for _ in range(token_count):
-                tokens.append(decode_token(file_object))
+            magic, version = struct.unpack("<4sB", prefix)
+            if magic != MAGIC:
+                raise ValueError("Invalid LZ77 file: incorrect file signature.")
 
-            extra_data = file_object.read()
-            if extra_data:
+            if version == LEGACY_VERSION:
+                return _read_legacy_v1(file_object)
+
+            if version != VERSION:
+                raise ValueError(f"Unsupported LZ77 file version: {version}")
+
+            rest = file_object.read(HEADER_SIZE - 5)
+            if len(rest) != HEADER_SIZE - 5:
+                raise ValueError("Invalid LZ77 file: incomplete header.")
+
+            storage_mode, window_size, lookahead_size, token_count, payload_size = struct.unpack(
+                "<BHHII", rest
+            )
+            if storage_mode not in (0, 1):
                 raise ValueError(
-                    "Corrupted LZ77 file: unexpected data after the last token."
+                    f"Unsupported LZ77 storage mode: {storage_mode}"
                 )
+
+            compressed_payload = file_object.read(payload_size)
+            if len(compressed_payload) != payload_size:
+                raise ValueError(
+                    "Corrupted LZ77 file: incomplete compressed payload."
+                )
+
+            if file_object.read(1):
+                raise ValueError(
+                    "Corrupted LZ77 file: unexpected data after compressed payload."
+                )
+
+            try:
+                raw_payload = zlib.decompress(compressed_payload)
+            except zlib.error as error:
+                raise ValueError(
+                    "Corrupted LZ77 file: invalid compressed payload."
+                ) from error
+
+            if storage_mode == 0:
+                tokens = _decode_tokens(raw_payload, token_count)
+            else:
+                try:
+                    original_text = raw_payload.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ValueError(
+                        "Corrupted LZ77 file: invalid UTF-8 fallback payload."
+                    ) from error
+
+                # Reconstruct a valid LZ77 literal-token stream.
+                tokens = [(0, 0, character) for character in original_text]
+
+                if len(tokens) != token_count:
+                    raise ValueError(
+                        "Corrupted LZ77 file: token count does not match fallback data."
+                    )
+
+            return tokens, window_size, lookahead_size
+
     except OSError as error:
         raise RuntimeError(f"Could not read LZ77 file:\n{error}") from error
-
-    return tokens, window_size, lookahead_size
