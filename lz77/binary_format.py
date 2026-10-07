@@ -406,3 +406,6 @@ def read_lz77_file(
 
     except OSError as error:
         raise RuntimeError(f"Could not read LZ77 file:\n{error}") from error
+
+
+  
