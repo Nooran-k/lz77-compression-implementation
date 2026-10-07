@@ -49,9 +49,9 @@ def compression_ratio_percent(
     original_size: int,
     compressed_size: int,
 ) -> float:
-    """Compressed size as a percentage of original size."""
+    """Percentage of bytes saved (positive = smaller compressed file)."""
 
     if original_size <= 0:
         return 0.0
 
-    return (compressed_size / original_size) * 100.0
+    return ((original_size - compressed_size) / original_size) * 100.0
