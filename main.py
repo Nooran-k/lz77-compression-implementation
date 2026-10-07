@@ -94,7 +94,12 @@ def compression_menu() -> None:
     print()
     print(f"Original size   : {original_size} bytes")
     print(f"Compressed size : {compressed_size} bytes")
-    print(f"Compression     : {ratio:.2f}%")
+    if ratio >= 0:
+        print(f"Compression     : {ratio:.2f}% smaller")
+    else:
+        print(f"Compression     : {-ratio:.2f}% larger")
+        print("Note: Lossless compression cannot guarantee a smaller file")
+        print("for every possible input, especially very small/random files.")
     print()
     print("Output file:")
     print(output_path)
